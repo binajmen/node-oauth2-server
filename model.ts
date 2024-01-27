@@ -1,17 +1,38 @@
 import OAuth2Server from "@node-oauth/oauth2-server";
+import crypto from "crypto";
 
 type Falsey = "" | 0 | false | null | undefined;
 
-type Client = Required<OAuth2Server.Client>;
+type Client = {
+  id: string;
+  redirectUris?: string | string[] | undefined;
+  grants: string | string[];
+  accessTokenLifetime?: number | undefined;
+  refreshTokenLifetime?: number | undefined;
+  [key: string]: any;
+};
 
-type User = Required<OAuth2Server.User>;
+type User = {
+  [key: string]: any;
+};
 
-type AuthorizationCode = Omit<
-  Required<OAuth2Server.AuthorizationCode>,
-  "client" | "user"
-> & { clientId: string; userId: string };
+type AuthorizationCode = {
+  authorizationCode: string;
+  expiresAt: Date;
+  redirectUri: string;
+  scope?: string[] | undefined;
+  clientId: string;
+  userId: string;
+  codeChallenge?: string;
+  codeChallengeMethod?: string;
+};
 
-type Token = Omit<Required<OAuth2Server.Token>, "client" | "user"> & {
+type Token = {
+  accessToken: string;
+  accessTokenExpiresAt?: Date | undefined;
+  refreshToken?: string | undefined;
+  refreshTokenExpiresAt?: Date | undefined;
+  scope?: string[] | undefined;
   clientId: string;
   userId: string;
 };
@@ -26,8 +47,18 @@ clients.set("123", {
 });
 
 const users = new Map<string, User>();
+users.set("alice", {
+  email: "alice@mail.com",
+  password: "secret",
+});
+users.set("bob", {
+  email: "bob@mail.com",
+  password: "secret",
+});
+
 const codes = new Map<string, AuthorizationCode>();
-const tokens = new Map<string, Token>();
+const accessTokens = new Map<string, Token>();
+const tokensByClientId = new Map<string, Token>();
 
 const dummyAuthorizationCode: OAuth2Server.AuthorizationCode = {
   authorizationCode: "string",
@@ -73,7 +104,24 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
     scope: string[]
   ): Promise<string> {
     console.info("generateAuthorizationCode", { client, user, scope });
-    return "authorization_code";
+
+    if (client.redirectUris === undefined || client.redirectUris.length === 0) {
+      throw new Error("Client redirectUris is empty");
+    }
+
+    const authorizationCode = crypto.randomBytes(16).toString("hex");
+    codes.set(authorizationCode, {
+      authorizationCode,
+      expiresAt: new Date(),
+      redirectUri: client.redirectUris[0],
+      scope,
+      clientId: client.id,
+      userId: user.id,
+      codeChallenge: "string",
+      codeChallengeMethod: "string",
+    });
+
+    return authorizationCode;
   }
 
   async saveAuthorizationCode(
@@ -90,20 +138,46 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
     user: OAuth2Server.User
   ): Promise<OAuth2Server.AuthorizationCode | Falsey> {
     console.info("saveAuthorizationCode", { code, client, user });
-    return dummyAuthorizationCode;
+
+    codes.set(code.authorizationCode, {
+      ...code,
+      clientId: client.id,
+      userId: user.id,
+    });
+
+    return { ...code, client, user };
   }
 
   async getAuthorizationCode(
     authorizationCode: string
   ): Promise<OAuth2Server.AuthorizationCode | Falsey> {
     console.info("getAuthorizationCode", { authorizationCode });
-    return dummyAuthorizationCode;
+
+    const code = codes.get(authorizationCode);
+    if (!code) {
+      throw new Error("Authorization code not found");
+    }
+
+    const client = clients.get(code.clientId);
+    if (!client) {
+      throw new Error("Client not found");
+    }
+
+    const user = users.get(code.userId);
+    if (!client || !user) {
+      throw new Error("User not found");
+    }
+
+    return { ...code, client, user };
   }
 
   async revokeAuthorizationCode(
     code: OAuth2Server.AuthorizationCode
   ): Promise<boolean> {
     console.info("revokeAuthorizationCode", { code });
+
+    codes.delete(code.authorizationCode);
+
     return true;
   }
 
@@ -113,7 +187,25 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
     scope: string[]
   ): Promise<string> {
     console.info("getAuthorizationCode", { client, user, scope });
-    return "access_token";
+
+    const accessToken = crypto.randomBytes(16).toString("hex");
+    const refreshToken = await this.generateRefreshToken(client, user, scope);
+
+    this.saveToken(
+      {
+        accessToken,
+        accessTokenExpiresAt: new Date(),
+        refreshToken,
+        refreshTokenExpiresAt: new Date(),
+        scope,
+        client,
+        user,
+      },
+      client,
+      user
+    );
+
+    return accessToken;
   }
 
   async generateRefreshToken(
@@ -122,7 +214,8 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
     scope: string[]
   ): Promise<string> {
     console.info("generateRefreshToken", { client, user, scope });
-    return "refresh_token";
+
+    return crypto.randomBytes(16).toString("hex");
   }
 
   async saveToken(
@@ -131,6 +224,27 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
     user: OAuth2Server.User
   ): Promise<OAuth2Server.Token | Falsey> {
     console.info("saveToken", { token, client, user });
+
+    const { client: _, user: __, ...rest } = token;
+
+    accessTokens.set(token.accessToken, {
+      ...rest,
+      clientId: client.id,
+      userId: user.id,
+    });
+
+    const oldToken = tokensByClientId.get(client.id);
+    if (oldToken) {
+      accessTokens.delete(oldToken.accessToken);
+      tokensByClientId.delete(client.id);
+    }
+
+    tokensByClientId.set(client.id, {
+      ...rest,
+      clientId: client.id,
+      userId: user.id,
+    });
+
     return dummyToken;
   }
 
@@ -138,7 +252,13 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
     accessToken: string
   ): Promise<OAuth2Server.Token | Falsey> {
     console.info("getAccessToken", { accessToken });
-    return dummyToken;
+
+    const { clientId, userId, ...token } = await this._getAccessToken(
+      accessToken
+    );
+    const { client, user } = await this.getClientAndUser(clientId, userId);
+
+    return { ...token, client, user };
   }
 
   async getRefreshToken(
@@ -176,5 +296,31 @@ export class Model implements OAuth2Server.AuthorizationCodeModel {
   ): Promise<OAuth2Server.User | Falsey> {
     console.info("getUser", { email, password });
     return {};
+  }
+
+  private async _getAccessToken(accessToken: string): Promise<Token> {
+    const token = accessTokens.get(accessToken);
+    if (!token) {
+      throw new Error("Token not found");
+    }
+
+    return token;
+  }
+
+  private async getClientAndUser(
+    clientId: string,
+    userId: string
+  ): Promise<{ client: Client; user: User }> {
+    const client = clients.get(clientId);
+    if (!client) {
+      throw new Error("Client not found");
+    }
+
+    const user = users.get(userId);
+    if (!client || !user) {
+      throw new Error("User not found");
+    }
+
+    return { client, user };
   }
 }
